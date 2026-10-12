@@ -131,7 +131,7 @@ jobs:
             exit 0
           fi
 
-          contentful space alias update \
+          contentful space environment-alias update \
             --alias-id "$ALIAS" \
             --target-environment-id "$NEXT" \
             --space-id "$CF_SPACE_ID" \

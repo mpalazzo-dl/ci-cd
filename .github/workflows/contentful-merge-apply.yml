@@ -1,0 +1,66 @@
+# Loop 1 (merge): apply migrations merged into main to the target environment
+# declared in contentful/merge.json.
+name: Contentful merge apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - migrations/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contentful-merge-apply
+  cancel-in-progress: false
+
+env:
+  CONTENTFUL_CLI_VERSION: 3.10.4
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Contentful CLI
+        run: npm install -g contentful-cli@${CONTENTFUL_CLI_VERSION}
+
+      - name: Find migrations in this push
+        id: files
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          files=$(git diff --name-only --diff-filter=AM "$BEFORE" HEAD -- 'migrations/*.cjs' | tr '\n' ' ')
+          echo "list=$files" >> "$GITHUB_OUTPUT"
+          echo "Migrations: ${files:-none}"
+
+      - name: Apply migrations
+        if: steps.files.outputs.list != ''
+        env:
+          CF_MANAGEMENT_TOKEN: ${{ secrets.CF_MANAGEMENT_TOKEN }}
+          CF_SPACE_ID: ${{ vars.CF_SPACE_ID }}
+          FILES: ${{ steps.files.outputs.list }}
+        run: |
+          TGT=$(jq -r .target contentful/merge.json)
+          {
+            echo "### 🚀 Contentful migrations applied"
+            echo "**Target environment:** \`$TGT\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in $FILES; do
+            echo "Applying $f to $TGT"
+            contentful space migration \
+              --space-id "$CF_SPACE_ID" \
+              --environment-id "$TGT" \
+              --management-token "$CF_MANAGEMENT_TOKEN" \
+              --yes "$f"
+            echo "- ✅ \`$f\`" >> "$GITHUB_STEP_SUMMARY"
+          done

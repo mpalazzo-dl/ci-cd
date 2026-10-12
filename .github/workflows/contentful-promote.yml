@@ -1,0 +1,145 @@
+# Loop 2 (blue/green): each branch owns a Contentful alias. When
+# contentful/release.json changes on a branch, re-point that branch's alias
+# to the environment it declares. Opt-in via the CF_BLUE_GREEN repo variable.
+name: Contentful promote (blue/green)
+
+on:
+  pull_request:
+    branches: [staging, main]
+    paths:
+      - contentful/release.json
+  push:
+    branches: [dev, staging, main]
+    paths:
+      - contentful/release.json
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: contentful-promote-${{ github.base_ref || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CF_API: https://api.contentful.com
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      alias: ${{ steps.map.outputs.alias }}
+      gh_env: ${{ steps.map.outputs.gh_env }}
+    steps:
+      - name: Map branch to alias
+        id: map
+        env:
+          BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          case "$BRANCH" in
+            dev)     echo "alias=dev"     >> "$GITHUB_OUTPUT"; echo "gh_env=dev"        >> "$GITHUB_OUTPUT" ;;
+            staging) echo "alias=staging" >> "$GITHUB_OUTPUT"; echo "gh_env=staging"    >> "$GITHUB_OUTPUT" ;;
+            main)    echo "alias=master"  >> "$GITHUB_OUTPUT"; echo "gh_env=production" >> "$GITHUB_OUTPUT" ;;
+            *) echo "No alias mapped for $BRANCH"; exit 1 ;;
+          esac
+
+  preview:
+    if: github.event_name == 'pull_request'
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build alias change preview
+        env:
+          CF_MANAGEMENT_TOKEN: ${{ secrets.CF_MANAGEMENT_TOKEN }}
+          CF_SPACE_ID: ${{ vars.CF_SPACE_ID }}
+          CF_BLUE_GREEN: ${{ vars.CF_BLUE_GREEN }}
+          ALIAS: ${{ needs.resolve.outputs.alias }}
+        run: |
+          NEXT=$(jq -r .environment contentful/release.json)
+          CURRENT=$(curl -sf -H "Authorization: Bearer $CF_MANAGEMENT_TOKEN" \
+            "$CF_API/spaces/$CF_SPACE_ID/environment_aliases/$ALIAS" | jq -r .environment.sys.id)
+          {
+            echo "### 🔵🟢 Contentful blue/green preview"
+            if [ "$CF_BLUE_GREEN" != "true" ]; then
+              echo "Blue/green is **not enabled** for this client. Alias \`$ALIAS\` will not change."
+            elif [ "$CURRENT" = "$NEXT" ]; then
+              echo "Alias \`$ALIAS\` already targets \`$NEXT\`. No change on merge."
+            else
+              echo "On merge, alias **\`$ALIAS\`** will move:"
+              echo
+              echo "\`$CURRENT\` → **\`$NEXT\`**"
+            fi
+          } > comment.md
+          cat comment.md
+
+      - uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: contentful-promote
+          path: comment.md
+
+  promote:
+    if: github.event_name == 'push'
+    needs: resolve
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.gh_env }}
+    steps:
+      - name: Check blue/green opt-in
+        id: gate
+        env:
+          CF_BLUE_GREEN: ${{ vars.CF_BLUE_GREEN }}
+        run: |
+          if [ "$CF_BLUE_GREEN" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Blue/green not enabled for this client: alias unchanged" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.enabled == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          node-version: 22
+
+      - name: Install Contentful CLI
+        if: steps.gate.outputs.enabled == 'true'
+        run: npm install -g contentful-cli@3.10.4
+
+      - name: Swap alias
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          CF_MANAGEMENT_TOKEN: ${{ secrets.CF_MANAGEMENT_TOKEN }}
+          CF_SPACE_ID: ${{ vars.CF_SPACE_ID }}
+          ALIAS: ${{ needs.resolve.outputs.alias }}
+        run: |
+          NEXT=$(jq -r .environment contentful/release.json)
+          auth=(-H "Authorization: Bearer $CF_MANAGEMENT_TOKEN")
+
+          status=$(curl -sf "${auth[@]}" "$CF_API/spaces/$CF_SPACE_ID/environments/$NEXT" | jq -r .sys.status.sys.id) || {
+            echo "::error::Environment $NEXT does not exist"; exit 1; }
+          if [ "$status" != "ready" ]; then
+            echo "::error::Environment $NEXT is $status, not ready"; exit 1
+          fi
+
+          PREV=$(curl -sf "${auth[@]}" "$CF_API/spaces/$CF_SPACE_ID/environment_aliases/$ALIAS" | jq -r .environment.sys.id)
+          if [ "$PREV" = "$NEXT" ]; then
+            echo "Alias $ALIAS already targets $NEXT" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          contentful space alias update \
+            --alias-id "$ALIAS" \
+            --target-environment-id "$NEXT" \
+            --space-id "$CF_SPACE_ID" \
+            --management-token "$CF_MANAGEMENT_TOKEN"
+
+          {
+            echo "### 🔵🟢 Alias \`$ALIAS\` promoted"
+            echo "\`$PREV\` → **\`$NEXT\`**"
+            echo
+            echo "Rollback: revert this commit. The pipeline re-points \`$ALIAS\` to \`$PREV\`."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,105 @@
+# Loop 1 (PR): diff the content models between two Contentful environments,
+# post the diff on the PR and commit the generated migration for review.
+name: Contentful merge preview
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - contentful/merge.json
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: contentful-merge-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CONTENTFUL_CLI_VERSION: 3.10.4
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Contentful CLI
+        run: npm install -g contentful-cli@${CONTENTFUL_CLI_VERSION}
+
+      - name: Configure Contentful CLI
+        env:
+          CF_MANAGEMENT_TOKEN: ${{ secrets.CF_MANAGEMENT_TOKEN }}
+          CF_SPACE_ID: ${{ vars.CF_SPACE_ID }}
+        run: contentful config add --management-token "$CF_MANAGEMENT_TOKEN" --active-space-id "$CF_SPACE_ID"
+
+      - name: Read merge request
+        id: merge
+        run: |
+          echo "source=$(jq -r .source contentful/merge.json)" >> "$GITHUB_OUTPUT"
+          echo "target=$(jq -r .target contentful/merge.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Show content model diff
+        env:
+          SRC: ${{ steps.merge.outputs.source }}
+          TGT: ${{ steps.merge.outputs.target }}
+        run: |
+          contentful merge show --se "$SRC" --te "$TGT" --yes 2>&1 \
+            | sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' | tee diff.txt
+
+      - name: Export diff as migration
+        id: export
+        env:
+          SRC: ${{ steps.merge.outputs.source }}
+          TGT: ${{ steps.merge.outputs.target }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          file="migrations/pr-${PR}-${SRC}-into-${TGT}.cjs"
+          contentful merge export --se "$SRC" --te "$TGT" --yes -o "$file"
+          if grep -qE 'createContentType|editContentType|deleteContentType' "$file"; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            rm -f "$file"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+
+      - name: Commit migration to PR branch
+        if: steps.export.outputs.has_changes == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(contentful): migration ${{ steps.merge.outputs.source }} -> ${{ steps.merge.outputs.target }}"
+          file_pattern: migrations/*.cjs
+
+      - name: Build PR comment
+        env:
+          SRC: ${{ steps.merge.outputs.source }}
+          TGT: ${{ steps.merge.outputs.target }}
+          HAS_CHANGES: ${{ steps.export.outputs.has_changes }}
+          FILE: ${{ steps.export.outputs.file }}
+        run: |
+          {
+            echo "### 🔀 Contentful content model diff"
+            echo "**Source:** \`$SRC\` → **Target:** \`$TGT\`"
+            echo
+            if [ "$HAS_CHANGES" = "true" ]; then
+              echo '```'
+              cat diff.txt
+              echo '```'
+              echo "Migration committed to \`$FILE\`. Merging this PR applies it to \`$TGT\`."
+            else
+              echo "✅ No content model differences. Nothing to merge."
+            fi
+          } > comment.md
+
+      - uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: contentful-merge
+          path: comment.md
